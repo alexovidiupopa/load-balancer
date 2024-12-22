@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"sync/atomic"
 	"time"
 )
 
@@ -15,9 +14,11 @@ type LoadBalancer struct {
 	index           uint32
 	rateLimiter     *RateLimiter
 	circuitBreakers []*CircuitBreaker
+	strategy        Strategy
+	weights         []int
 }
 
-func NewLoadBalancer(servers []string, rateLimiter *RateLimiter) *LoadBalancer {
+func NewLoadBalancer(servers []string, rateLimiter *RateLimiter, strategy Strategy, weights []int) *LoadBalancer {
 	urls := make([]*url.URL, len(servers))
 	healthy := make([]bool, len(servers))
 	circuitBreakers := make([]*CircuitBreaker, len(servers))
@@ -27,39 +28,12 @@ func NewLoadBalancer(servers []string, rateLimiter *RateLimiter) *LoadBalancer {
 			panic(err)
 		}
 		urls[i] = url
-		healthy[i] = true                                         // Assume all servers are healthy initially
-		circuitBreakers[i] = NewCircuitBreaker(3, 10*time.Second) // 3 failures, 10 seconds reset timeout
+		healthy[i] = true
+		circuitBreakers[i] = NewCircuitBreaker(3, 10*time.Second)
 	}
-	lb := &LoadBalancer{servers: urls, healthy: healthy, rateLimiter: rateLimiter, circuitBreakers: circuitBreakers}
+	lb := &LoadBalancer{servers: urls, healthy: healthy, rateLimiter: rateLimiter, circuitBreakers: circuitBreakers, strategy: strategy, weights: weights}
 	go lb.healthCheck()
 	return lb
-}
-
-func (lb *LoadBalancer) healthCheck() {
-	for {
-		for i, server := range lb.servers {
-			resp, err := http.Get(server.String() + "/health")
-			if err != nil || resp.StatusCode != http.StatusOK {
-				lb.healthy[i] = false
-			} else {
-				lb.healthy[i] = true
-			}
-			if resp != nil {
-				resp.Body.Close()
-			}
-		}
-		time.Sleep(30 * time.Second) // Check every 30 seconds
-	}
-}
-
-func (lb *LoadBalancer) getNextServer() *url.URL {
-	for {
-		index := atomic.AddUint32(&lb.index, 1)
-		server := lb.servers[(int(index)-1)%len(lb.servers)]
-		if lb.healthy[(int(index)-1)%len(lb.servers)] {
-			return server
-		}
-	}
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -69,8 +43,8 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	logRequest(r)
 	start := time.Now()
-	target := lb.getNextServer()
-	cb := lb.circuitBreakers[(int(lb.index)-1)%len(lb.servers)]
+	target := lb.getNextServer(r)
+	cb := lb.circuitBreakers[(int(lb.index))%len(lb.servers)]
 	if !cb.AllowRequest() {
 		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
 		return
